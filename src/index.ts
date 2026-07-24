@@ -4,15 +4,37 @@ import { z } from "zod";
 
 export interface Env {
   GITHUB_TOKEN: string;
+  MCP_API_KEY: string;
   MCP_OBJECT: DurableObjectNamespace;
 }
 
-const headers = (token: string) => ({
+const githubHeaders = (token: string) => ({
   Authorization: `token ${token}`,
   "User-Agent": "github-mcp-cloudflare",
   "Content-Type": "application/json",
   Accept: "application/vnd.github+json",
 });
+
+// API Key 認証ミドルウェア
+function authenticate(request: Request, env: Env): Response | null {
+  // /mcp エンドポイントのみ認証を適用
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith("/mcp")) return null;
+
+  // MCP_API_KEY が設定されていない場合はスキップ（開発時のフォールバック）
+  if (!env.MCP_API_KEY) return null;
+
+  const apiKey = request.headers.get("X-API-Key") ??
+    new URL(request.url).searchParams.get("api_key");
+
+  if (!apiKey || apiKey !== env.MCP_API_KEY) {
+    return new Response(
+      JSON.stringify({ error: "Unauthorized: Invalid or missing API key" }),
+      { status: 401, headers: { "Content-Type": "application/json" } }
+    );
+  }
+  return null;
+}
 
 export class GitHubMCP extends McpAgent {
   server = new McpServer({ name: "github-mcp", version: "1.0.0" });
@@ -33,7 +55,7 @@ export class GitHubMCP extends McpAgent {
       },
       async ({ owner, repo }) => {
         const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
-          headers: headers(token()),
+          headers: githubHeaders(token()),
         });
         const data = await res.json();
         return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
@@ -47,7 +69,7 @@ export class GitHubMCP extends McpAgent {
       async ({ owner, repo }) => {
         const res = await fetch(
           `https://api.github.com/repos/${owner}/${repo}/issues`,
-          { headers: headers(token()) }
+          { headers: githubHeaders(token()) }
         );
         const data = await res.json();
         return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
@@ -61,7 +83,7 @@ export class GitHubMCP extends McpAgent {
       async ({ owner, repo }) => {
         const res = await fetch(
           `https://api.github.com/repos/${owner}/${repo}/pulls`,
-          { headers: headers(token()) }
+          { headers: githubHeaders(token()) }
         );
         const data = await res.json();
         return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
@@ -94,7 +116,7 @@ export class GitHubMCP extends McpAgent {
 
         const res = await fetch(
           `https://api.github.com/repos/${owner}/${repo}/contents/${path}`,
-          { method: "PUT", headers: headers(token()), body: JSON.stringify(body) }
+          { method: "PUT", headers: githubHeaders(token()), body: JSON.stringify(body) }
         );
         const data = await res.json();
         return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
@@ -111,22 +133,20 @@ export class GitHubMCP extends McpAgent {
         from_branch: z.string().default("main").describe("基点にするブランチ名（デフォルト: main）"),
       },
       async ({ owner, repo, branch, from_branch }) => {
-        // 基点ブランチの最新 SHA を取得
         const refRes = await fetch(
           `https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${from_branch}`,
-          { headers: headers(token()) }
+          { headers: githubHeaders(token()) }
         );
         const refData = await refRes.json() as { object?: { sha?: string } };
         const sha = refData?.object?.sha;
         if (!sha) {
           return { content: [{ type: "text" as const, text: `エラー: ${from_branch} の SHA を取得できませんでした` }] };
         }
-
         const res = await fetch(
           `https://api.github.com/repos/${owner}/${repo}/git/refs`,
           {
             method: "POST",
-            headers: headers(token()),
+            headers: githubHeaders(token()),
             body: JSON.stringify({ ref: `refs/heads/${branch}`, sha }),
           }
         );
@@ -151,7 +171,7 @@ export class GitHubMCP extends McpAgent {
           `https://api.github.com/repos/${owner}/${repo}/pulls`,
           {
             method: "POST",
-            headers: headers(token()),
+            headers: githubHeaders(token()),
             body: JSON.stringify({ title, body, head, base }),
           }
         );
@@ -163,6 +183,11 @@ export class GitHubMCP extends McpAgent {
 }
 
 export default {
-  fetch: (req: Request, env: Env) =>
-    GitHubMCP.serve("/mcp").fetch(req, env),
+  fetch(request: Request, env: Env): Promise<Response> | Response {
+    // API Key 認証チェック
+    const authError = authenticate(request, env);
+    if (authError) return authError;
+
+    return GitHubMCP.serve("/mcp").fetch(request, env);
+  },
 };
