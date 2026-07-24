@@ -15,25 +15,26 @@ const githubHeaders = (token: string) => ({
   Accept: "application/vnd.github+json",
 });
 
-// API Key 認証ミドルウェア
-// サポートする認証方式:
-//   1. Authorization: Bearer <token>  (Perplexity など OAuth2 準拠クライアント向け)
-//   2. X-API-Key: <token>             (従来方式)
-//   3. x-api-key: <token>             (小文字ヘッダー)
-//   4. ?api_key=<token>               (クエリパラメータ)
+/**
+ * API Key authentication middleware
+ * Supported auth methods (in priority order):
+ *   1. Authorization: Bearer <token>  (recommended for Perplexity / OAuth2 clients)
+ *   2. X-API-Key: <token>
+ *   3. x-api-key: <token>
+ *   4. ?api_key=<token>               (query parameter)
+ */
 function authenticate(request: Request, env: Env): Response | null {
   const url = new URL(request.url);
 
-  // ヘルスチェックエンドポイントは認証不要
+  // Health check endpoints do not require authentication
   if (url.pathname === "/" || url.pathname === "/health") return null;
 
-  // /mcp エンドポイントのみ認証を適用
+  // Only enforce auth on /mcp
   if (!url.pathname.startsWith("/mcp")) return null;
 
-  // MCP_API_KEY が設定されていない場合はスキップ（開発時のフォールバック）
+  // Skip auth if MCP_API_KEY is not configured (dev fallback)
   if (!env.MCP_API_KEY) return null;
 
-  // 認証情報の抽出
   let apiKey: string | null = null;
 
   // 1. Authorization: Bearer <token>
@@ -43,12 +44,12 @@ function authenticate(request: Request, env: Env): Response | null {
     if (match) apiKey = match[1];
   }
 
-  // 2. X-API-Key / x-api-key ヘッダー
+  // 2. X-API-Key / x-api-key header
   if (!apiKey) {
     apiKey = request.headers.get("X-API-Key") ?? request.headers.get("x-api-key");
   }
 
-  // 3. クエリパラメータ
+  // 3. Query parameter
   if (!apiKey) {
     apiKey = url.searchParams.get("api_key");
   }
@@ -84,15 +85,15 @@ export class GitHubMCP extends McpAgent {
     const token = () => (this.env as Env).GITHUB_TOKEN;
 
     // ----------------------------------------
-    // 読み取り系
+    // Read tools
     // ----------------------------------------
 
     this.server.tool(
       "get_repo",
-      "GitHubリポジトリの情報を取得する",
+      "Get information about a GitHub repository.",
       {
-        owner: z.string().describe("リポジトリオーナー名"),
-        repo: z.string().describe("リポジトリ名"),
+        owner: z.string().describe("Repository owner (username or organization)"),
+        repo: z.string().describe("Repository name"),
       },
       async ({ owner, repo }) => {
         const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
@@ -105,8 +106,11 @@ export class GitHubMCP extends McpAgent {
 
     this.server.tool(
       "list_issues",
-      "GitHubリポジトリの Issue 一覧を取得する",
-      { owner: z.string(), repo: z.string() },
+      "List issues in a GitHub repository.",
+      {
+        owner: z.string().describe("Repository owner (username or organization)"),
+        repo: z.string().describe("Repository name"),
+      },
       async ({ owner, repo }) => {
         const res = await fetch(
           `https://api.github.com/repos/${owner}/${repo}/issues`,
@@ -119,8 +123,11 @@ export class GitHubMCP extends McpAgent {
 
     this.server.tool(
       "list_pull_requests",
-      "GitHubリポジトリの Pull Request 一覧を取得する",
-      { owner: z.string(), repo: z.string() },
+      "List pull requests in a GitHub repository.",
+      {
+        owner: z.string().describe("Repository owner (username or organization)"),
+        repo: z.string().describe("Repository name"),
+      },
       async ({ owner, repo }) => {
         const res = await fetch(
           `https://api.github.com/repos/${owner}/${repo}/pulls`,
@@ -132,20 +139,20 @@ export class GitHubMCP extends McpAgent {
     );
 
     // ----------------------------------------
-    // 書き込み系
+    // Write tools
     // ----------------------------------------
 
     this.server.tool(
       "create_or_update_file",
-      "ファイルを作成または更新してコミットする。新規ファイルなら sha は不要。既存ファイル更新時は sha が必須。",
+      "Create or update a file in a GitHub repository and commit it. SHA is required when updating an existing file; omit it for new files.",
       {
-        owner: z.string().describe("リポジトリオーナー名"),
-        repo: z.string().describe("リポジトリ名"),
-        path: z.string().describe("ファイルパス（例: src/hello.ts）"),
-        content: z.string().describe("ファイルの内容（プレーンテキスト）"),
-        message: z.string().describe("コミットメッセージ"),
-        branch: z.string().default("main").describe("ブランチ名（デフォルト: main）"),
-        sha: z.string().optional().describe("既存ファイルを更新する際に必要な blob SHA"),
+        owner: z.string().describe("Repository owner (username or organization)"),
+        repo: z.string().describe("Repository name"),
+        path: z.string().describe("File path (e.g. src/hello.ts)"),
+        content: z.string().describe("File content as plain text"),
+        message: z.string().describe("Commit message"),
+        branch: z.string().default("main").describe("Target branch (default: main)"),
+        sha: z.string().optional().describe("Blob SHA of the existing file; required when updating"),
       },
       async ({ owner, repo, path, content, message, branch, sha }) => {
         const body: Record<string, unknown> = {
@@ -166,12 +173,12 @@ export class GitHubMCP extends McpAgent {
 
     this.server.tool(
       "create_branch",
-      "GitHubリポジトリに新しいブランチを作成する",
+      "Create a new branch in a GitHub repository.",
       {
-        owner: z.string(),
-        repo: z.string(),
-        branch: z.string().describe("作成するブランチ名"),
-        from_branch: z.string().default("main").describe("基点にするブランチ名（デフォルト: main）"),
+        owner: z.string().describe("Repository owner (username or organization)"),
+        repo: z.string().describe("Repository name"),
+        branch: z.string().describe("Name of the new branch to create"),
+        from_branch: z.string().default("main").describe("Source branch to branch from (default: main)"),
       },
       async ({ owner, repo, branch, from_branch }) => {
         const refRes = await fetch(
@@ -181,7 +188,7 @@ export class GitHubMCP extends McpAgent {
         const refData = await refRes.json() as { object?: { sha?: string } };
         const sha = refData?.object?.sha;
         if (!sha) {
-          return { content: [{ type: "text" as const, text: `エラー: ${from_branch} の SHA を取得できませんでした` }] };
+          return { content: [{ type: "text" as const, text: `Error: could not resolve SHA for branch '${from_branch}'` }] };
         }
         const res = await fetch(
           `https://api.github.com/repos/${owner}/${repo}/git/refs`,
@@ -198,14 +205,14 @@ export class GitHubMCP extends McpAgent {
 
     this.server.tool(
       "create_pull_request",
-      "GitHubリポジトリに Pull Request を作成する",
+      "Create a pull request in a GitHub repository.",
       {
-        owner: z.string(),
-        repo: z.string(),
-        title: z.string().describe("PR タイトル"),
-        body: z.string().default("").describe("PR 本文（ディスクリプション）"),
-        head: z.string().describe("マージ元ブランチ名"),
-        base: z.string().default("main").describe("マージ先ブランチ名（デフォルト: main）"),
+        owner: z.string().describe("Repository owner (username or organization)"),
+        repo: z.string().describe("Repository name"),
+        title: z.string().describe("Pull request title"),
+        body: z.string().default("").describe("Pull request description body"),
+        head: z.string().describe("Name of the branch to merge from"),
+        base: z.string().default("main").describe("Name of the branch to merge into (default: main)"),
       },
       async ({ owner, repo, title, body, head, base }) => {
         const res = await fetch(
@@ -227,7 +234,7 @@ export default {
   fetch(request: Request, env: Env): Promise<Response> | Response {
     const url = new URL(request.url);
 
-    // ヘルスチェック: GET / および GET /health
+    // Health check endpoints (no auth required)
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
       return new Response(
         JSON.stringify({
@@ -241,27 +248,11 @@ export default {
       );
     }
 
-    // GET /mcp にも 200 を返す（Perplexity の接続確認用）
-    if (request.method === "GET" && url.pathname === "/mcp") {
-      // 認証チェック
-      const authError = authenticate(request, env);
-      if (authError) return authError;
-
-      return new Response(
-        JSON.stringify({
-          status: "ok",
-          service: "github-mcp-cloudflare",
-          transport: "streamable-http",
-          message: "MCP endpoint is ready. Use POST to interact."
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } }
-      );
-    }
-
-    // API Key 認証チェック（POST /mcp など）
+    // Authenticate all /mcp requests
     const authError = authenticate(request, env);
     if (authError) return authError;
 
+    // Delegate everything under /mcp to the MCP SDK handler
     return GitHubMCP.serve("/mcp").fetch(request, env);
   },
 };
