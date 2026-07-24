@@ -138,6 +138,117 @@ export class GitHubMCP extends McpAgent {
       }
     );
 
+    this.server.tool(
+      "list_contents",
+      "List files and directories at a given path in a GitHub repository. Use path '/' or '' for the root directory.",
+      {
+        owner: z.string().describe("Repository owner (username or organization)"),
+        repo: z.string().describe("Repository name"),
+        path: z.string().default("").describe("Directory path to list (e.g. 'src' or 'src/components'). Leave empty or use '/' for root."),
+        ref: z.string().optional().describe("Branch, tag, or commit SHA (default: repository's default branch)"),
+      },
+      async ({ owner, repo, path, ref }) => {
+        const cleanPath = path.replace(/^\/+/, "");
+        const url = new URL(`https://api.github.com/repos/${owner}/${repo}/contents/${cleanPath}`);
+        if (ref) url.searchParams.set("ref", ref);
+
+        const res = await fetch(url.toString(), { headers: githubHeaders(token()) });
+        const data = await res.json() as unknown;
+
+        if (!res.ok) {
+          return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+        }
+
+        // GitHub returns an array for directories, object for files
+        if (!Array.isArray(data)) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Error: '${cleanPath || "/"}' is a file, not a directory. Use get_contents to read file content.`,
+            }],
+          };
+        }
+
+        const entries = (data as Array<{ type: string; name: string; path: string; size: number; sha: string; html_url: string }>)
+          .map((item) => ({
+            type: item.type,
+            name: item.name,
+            path: item.path,
+            size: item.type === "file" ? item.size : undefined,
+            sha: item.sha,
+            html_url: item.html_url,
+          }));
+
+        const summary = entries
+          .map((e) =>
+            e.type === "dir"
+              ? `📁 ${e.name}/`
+              : `📄 ${e.name} (${e.size ?? 0} bytes)`
+          )
+          .join("\n");
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Contents of '${cleanPath || "/"}' (${entries.length} items):\n\n${summary}\n\n---\nFull metadata:\n${JSON.stringify(entries, null, 2)}`,
+          }],
+        };
+      }
+    );
+
+    this.server.tool(
+      "get_contents",
+      "Read the content of a specific file in a GitHub repository. Returns decoded text content.",
+      {
+        owner: z.string().describe("Repository owner (username or organization)"),
+        repo: z.string().describe("Repository name"),
+        path: z.string().describe("File path (e.g. 'src/index.ts' or 'README.md')"),
+        ref: z.string().optional().describe("Branch, tag, or commit SHA (default: repository's default branch)"),
+      },
+      async ({ owner, repo, path, ref }) => {
+        const cleanPath = path.replace(/^\/+/, "");
+        const url = new URL(`https://api.github.com/repos/${owner}/${repo}/contents/${cleanPath}`);
+        if (ref) url.searchParams.set("ref", ref);
+
+        const res = await fetch(url.toString(), { headers: githubHeaders(token()) });
+        const data = await res.json() as unknown;
+
+        if (!res.ok) {
+          return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+        }
+
+        if (Array.isArray(data)) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Error: '${cleanPath}' is a directory, not a file. Use list_contents to browse directories.`,
+            }],
+          };
+        }
+
+        const file = data as { type: string; name: string; path: string; size: number; sha: string; encoding: string; content: string; html_url: string };
+
+        if (file.type !== "file") {
+          return { content: [{ type: "text" as const, text: `Unexpected type: ${file.type}` }] };
+        }
+
+        // Decode base64 content
+        let decoded: string;
+        try {
+          decoded = decodeURIComponent(escape(atob(file.content.replace(/\n/g, ""))));
+        } catch {
+          decoded = `(Binary file — base64 content below)\n${file.content}`;
+        }
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `File: ${file.path}\nSHA: ${file.sha}\nSize: ${file.size} bytes\nURL: ${file.html_url}\n\n---\n${decoded}`,
+          }],
+        };
+      }
+    );
+
     // ----------------------------------------
     // Write tools
     // ----------------------------------------
