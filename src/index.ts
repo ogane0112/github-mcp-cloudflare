@@ -16,23 +16,64 @@ const githubHeaders = (token: string) => ({
 });
 
 // API Key 認証ミドルウェア
+// サポートする認証方式:
+//   1. Authorization: Bearer <token>  (Perplexity など OAuth2 準拠クライアント向け)
+//   2. X-API-Key: <token>             (従来方式)
+//   3. x-api-key: <token>             (小文字ヘッダー)
+//   4. ?api_key=<token>               (クエリパラメータ)
 function authenticate(request: Request, env: Env): Response | null {
-  // /mcp エンドポイントのみ認証を適用
   const url = new URL(request.url);
+
+  // ヘルスチェックエンドポイントは認証不要
+  if (url.pathname === "/" || url.pathname === "/health") return null;
+
+  // /mcp エンドポイントのみ認証を適用
   if (!url.pathname.startsWith("/mcp")) return null;
 
   // MCP_API_KEY が設定されていない場合はスキップ（開発時のフォールバック）
   if (!env.MCP_API_KEY) return null;
 
-  const apiKey = request.headers.get("X-API-Key") ??
-    new URL(request.url).searchParams.get("api_key");
+  // 認証情報の抽出
+  let apiKey: string | null = null;
+
+  // 1. Authorization: Bearer <token>
+  const authHeader = request.headers.get("Authorization");
+  if (authHeader) {
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (match) apiKey = match[1];
+  }
+
+  // 2. X-API-Key / x-api-key ヘッダー
+  if (!apiKey) {
+    apiKey = request.headers.get("X-API-Key") ?? request.headers.get("x-api-key");
+  }
+
+  // 3. クエリパラメータ
+  if (!apiKey) {
+    apiKey = url.searchParams.get("api_key");
+  }
 
   if (!apiKey || apiKey !== env.MCP_API_KEY) {
     return new Response(
-      JSON.stringify({ error: "Unauthorized: Invalid or missing API key" }),
-      { status: 401, headers: { "Content-Type": "application/json" } }
+      JSON.stringify({
+        error: "Unauthorized",
+        message: "Invalid or missing API key. Provide it via 'Authorization: Bearer <key>', 'X-API-Key: <key>' header, or '?api_key=<key>' query parameter.",
+        supported_auth: [
+          "Authorization: Bearer <key>",
+          "X-API-Key: <key>",
+          "?api_key=<key>"
+        ]
+      }),
+      {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+          "WWW-Authenticate": "Bearer realm=\"github-mcp-cloudflare\""
+        }
+      }
     );
   }
+
   return null;
 }
 
@@ -184,7 +225,40 @@ export class GitHubMCP extends McpAgent {
 
 export default {
   fetch(request: Request, env: Env): Promise<Response> | Response {
-    // API Key 認証チェック
+    const url = new URL(request.url);
+
+    // ヘルスチェック: GET / および GET /health
+    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
+      return new Response(
+        JSON.stringify({
+          status: "ok",
+          service: "github-mcp-cloudflare",
+          version: "1.0.0",
+          mcp_endpoint: "/mcp",
+          auth_methods: ["Authorization: Bearer <key>", "X-API-Key: <key>", "?api_key=<key>"]
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // GET /mcp にも 200 を返す（Perplexity の接続確認用）
+    if (request.method === "GET" && url.pathname === "/mcp") {
+      // 認証チェック
+      const authError = authenticate(request, env);
+      if (authError) return authError;
+
+      return new Response(
+        JSON.stringify({
+          status: "ok",
+          service: "github-mcp-cloudflare",
+          transport: "streamable-http",
+          message: "MCP endpoint is ready. Use POST to interact."
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // API Key 認証チェック（POST /mcp など）
     const authError = authenticate(request, env);
     if (authError) return authError;
 
