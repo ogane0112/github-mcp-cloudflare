@@ -1,70 +1,72 @@
 # github-mcp-cloudflare
 
-Cloudflare Workers 上にデプロイするカスタム GitHub MCP サーバー。
-Perplexity の Custom Remote Connector から利用することを主目的としています。
+A custom GitHub MCP server deployed on Cloudflare Workers.
+Designed primarily for use with Perplexity's Custom Remote Connector.
 
-## 機能
+## Tools
 
-- `get_repo` - GitHub リポジトリ情報を取得
-- `list_issues` - Issue 一覧を取得
-- `list_pull_requests` - Pull Request 一覧を取得
-- `create_or_update_file` - ファイルを作成・更新してコミット
-- `create_branch` - ブランチを作成
-- `create_pull_request` - Pull Request を作成
+| Tool | Description |
+|---|---|
+| `get_repo` | Get information about a GitHub repository |
+| `list_issues` | List issues in a repository |
+| `list_pull_requests` | List pull requests in a repository |
+| `create_or_update_file` | Create or update a file and commit it |
+| `create_branch` | Create a new branch |
+| `create_pull_request` | Create a pull request |
 
-## エンドポイント
+## Endpoints
 
-| パス | 認証 | 説明 |
+| Path | Auth | Description |
 |---|---|---|
-| `GET /` | 不要 | ヘルスチェック |
-| `GET /health` | 不要 | ヘルスチェック |
-| `GET /mcp` | 必要 | MCP 接続確認（200 OK を返す） |
-| `POST /mcp` | 必要 | MCP メインエンドポイント |
+| `GET /` | Not required | Health check |
+| `GET /health` | Not required | Health check |
+| `POST /mcp` | Required | MCP main endpoint (Streamable HTTP) |
 
-## セットアップ
+> **Note:** `GET /mcp` is handled directly by the MCP SDK. The previous custom `GET /mcp` response branch has been removed to improve compatibility with Perplexity.
+
+## Setup
 
 ```bash
 npm install
 ```
 
-## ローカル開発
+## Local Development
 
 ```bash
-# .dev.vars を作成
+# Create .dev.vars
 echo "GITHUB_TOKEN=ghp_xxxx" > .dev.vars
-echo "MCP_API_KEY=任意のキー" >> .dev.vars
+echo "MCP_API_KEY=your-key" >> .dev.vars
 
 npm run dev
 ```
 
-## デプロイ
+## Deploy
 
 ```bash
-# シークレットを設定
+# Set secrets
 wrangler secret put GITHUB_TOKEN
 wrangler secret put MCP_API_KEY
 
-# デプロイ
+# Deploy
 npm run deploy
 ```
 
-## API Key 認証
+## Authentication
 
-以下の**いずれか**の方式で API Key を渡すことができます。
-優先順位: Bearer > X-API-Key > api_key クエリパラメータ
+The following methods are supported (priority order: Bearer > X-API-Key > api_key query param):
 
 ```http
-# 方式1: Authorization Bearer（Perplexity 推奨）
+# Method 1: Authorization Bearer (recommended for Perplexity)
 Authorization: Bearer <your-api-key>
 
-# 方式2: X-API-Key ヘッダー
+# Method 2: X-API-Key header
 X-API-Key: <your-api-key>
 
-# 方式3: クエリパラメータ
+# Method 3: Query parameter
 https://xxx.workers.dev/mcp?api_key=<your-api-key>
 ```
 
-認証失敗時は以下の JSON とともに `401` を返します:
+On authentication failure, the server returns `401` with a JSON body:
 
 ```json
 {
@@ -78,59 +80,95 @@ https://xxx.workers.dev/mcp?api_key=<your-api-key>
 }
 ```
 
-## Perplexity カスタムコネクター設定
+## Perplexity Custom Connector Setup
 
-> Perplexity の MCP 接続確認では `GET /mcp` に対してリクエストを送る場合があります。
-> 本実装では `GET /mcp` も認証付きで `200 OK` を返します。
+### Recommended: Bearer Token
 
-### Authentication: API Key 方式（推奨）
+| Field | Value |
+|---|---|
+| Name | `github-mcp-cloudflare` |
+| MCP Server URL | `https://github-mcp-cloudflare.t4qjpmb66z.workers.dev/mcp` |
+| Authentication | `Bearer Token` |
+| Token | Value set via `wrangler secret put MCP_API_KEY` |
+| Transport | `Streamable HTTP` |
 
-| 項目 | 値 |
+### Alternative: API Key (X-API-Key header)
+
+| Field | Value |
 |---|---|
 | Name | `github-mcp-cloudflare` |
 | MCP Server URL | `https://github-mcp-cloudflare.t4qjpmb66z.workers.dev/mcp` |
 | Authentication | `API Key` |
 | Header name | `X-API-Key` |
-| API Key 値 | `wrangler secret put MCP_API_KEY` で設定した値 |
+| API Key value | Value set via `wrangler secret put MCP_API_KEY` |
 | Transport | `Streamable HTTP` |
 
-### Authentication: Bearer Token 方式（代替）
+### ⚠️ Perplexity Compatibility Notes
 
-Perplexity が `Authorization: Bearer` を使う場合はこちら。
+- **Bearer Token is more reliable** than API Key for Perplexity's connector. Use Bearer Token if the tool list does not appear.
+- **All tool descriptions are in English.** Japanese descriptions were found to cause issues with Perplexity's tool rendering.
+- **`GET /mcp` custom response has been removed.** All `/mcp` traffic is now handled by the MCP SDK to avoid protocol conflicts.
+- **Streamable HTTP requires both `application/json` and `text/event-stream` in the `Accept` header.** If you test with curl/PowerShell and get `Not Acceptable`, add the Accept header:
 
-| 項目 | 値 |
-|---|---|
-| Name | `github-mcp-cloudflare` |
-| MCP Server URL | `https://github-mcp-cloudflare.t4qjpmb66z.workers.dev/mcp` |
-| Authentication | `Bearer Token` |
-| Token | `wrangler secret put MCP_API_KEY` で設定した値 |
-| Transport | `Streamable HTTP` |
-
-### 接続確認（curl）
-
-```bash
-# ヘルスチェック（認証不要）
-curl https://github-mcp-cloudflare.t4qjpmb66z.workers.dev/
-
-# MCP エンドポイント確認（Bearer）
-curl -H "Authorization: Bearer YOUR_KEY" \
-  https://github-mcp-cloudflare.t4qjpmb66z.workers.dev/mcp
-
-# MCP エンドポイント確認（X-API-Key）
-curl -H "X-API-Key: YOUR_KEY" \
-  https://github-mcp-cloudflare.t4qjpmb66z.workers.dev/mcp
+```powershell
+# PowerShell: correct Accept header for tools/list
+Invoke-WebRequest `
+  -Uri "https://github-mcp-cloudflare.t4qjpmb66z.workers.dev/mcp" `
+  -Method POST `
+  -Headers @{
+    "Authorization" = "Bearer YOUR_KEY"
+    "Content-Type"  = "application/json"
+    "Accept"        = "application/json, text/event-stream"
+    "mcp-session-id" = "SESSION_ID_FROM_INITIALIZE"
+  } `
+  -Body '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 ```
 
-## Fine-grained Token の必要パーミッション
+### Manual Verification (PowerShell)
 
-| Permission | 設定値 |
+**1. Health check (no auth)**
+```powershell
+iwr "https://github-mcp-cloudflare.t4qjpmb66z.workers.dev/"
+```
+
+**2. Initialize**
+```powershell
+Invoke-WebRequest `
+  -Uri "https://github-mcp-cloudflare.t4qjpmb66z.workers.dev/mcp" `
+  -Method POST `
+  -Headers @{
+    "Authorization" = "Bearer YOUR_KEY"
+    "Content-Type"  = "application/json"
+    "Accept"        = "application/json, text/event-stream"
+  } `
+  -Body '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+```
+
+**3. tools/list** (use `mcp-session-id` from initialize response)
+```powershell
+Invoke-WebRequest `
+  -Uri "https://github-mcp-cloudflare.t4qjpmb66z.workers.dev/mcp" `
+  -Method POST `
+  -Headers @{
+    "Authorization"  = "Bearer YOUR_KEY"
+    "Content-Type"   = "application/json"
+    "Accept"         = "application/json, text/event-stream"
+    "mcp-session-id" = "VALUE_FROM_INITIALIZE"
+  } `
+  -Body '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+```
+
+## Fine-grained Token Permissions
+
+| Permission | Setting |
 |---|---|
 | Contents | Read and write |
 | Pull requests | Read and write |
 | Issues | Read |
-| Metadata | Read（自動付与） |
+| Metadata | Read (auto-granted) |
 
-## 参考
+## References
 
 - [Cloudflare Docs: Build a Remote MCP server](https://developers.cloudflare.com/agents/model-context-protocol/guides/remote-mcp-server/)
 - [Cloudflare Blog: Remote MCP Servers](https://blog.cloudflare.com/remote-model-context-protocol-servers-mcp/)
+- [MCP Specification: Streamable HTTP Transport](https://spec.modelcontextprotocol.io/specification/basic/transports/)
