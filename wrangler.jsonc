@@ -24,6 +24,11 @@
   "migrations": [
     {
       "tag": "v1",
+      "new_sqlite_classes": ["GitHubMCP"]
+    },
+    {
+      "tag": "v2",
+      "deleted_classes": ["GitHubMCP"],
       "new_sqlite_classes": ["ApiKeyGitHubMCP", "OAuthGitHubMCP"]
     }
   ]
