@@ -7,7 +7,11 @@
     "bindings": [
       {
         "name": "MCP_OBJECT",
-        "class_name": "GitHubMCP"
+        "class_name": "ApiKeyGitHubMCP"
+      },
+      {
+        "name": "MCP_OAUTH_OBJECT",
+        "class_name": "OAuthGitHubMCP"
       }
     ]
   },
@@ -21,6 +25,11 @@
     {
       "tag": "v1",
       "new_classes": ["GitHubMCP"]
+    },
+    {
+      "tag": "v2",
+      "new_classes": ["ApiKeyGitHubMCP", "OAuthGitHubMCP"],
+      "deleted_classes": ["GitHubMCP"]
     }
   ]
 }
