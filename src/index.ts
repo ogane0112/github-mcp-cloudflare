@@ -1,10 +1,16 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { z } from "zod";
+import { GitHubOAuthHandler } from "./github-handler";
 
 export interface Env {
   GITHUB_TOKEN: string;
   MCP_API_KEY: string;
+  GITHUB_CLIENT_ID: string;
+  GITHUB_CLIENT_SECRET: string;
+  COOKIE_ENCRYPTION_KEY: string;
+  OAUTH_KV: KVNamespace;
   MCP_OBJECT: DurableObjectNamespace;
 }
 
@@ -16,73 +22,72 @@ const githubHeaders = (token: string) => ({
 });
 
 /**
- * API Key authentication middleware
- * Supported auth methods (in priority order):
- *   1. Authorization: Bearer <token>  (recommended for Perplexity / OAuth2 clients)
+ * API Key authentication (for Perplexity)
+ * Supported:
+ *   1. Authorization: Bearer <token>
  *   2. X-API-Key: <token>
- *   3. x-api-key: <token>
- *   4. ?api_key=<token>               (query parameter)
+ *   3. ?api_key=<token>
  */
-function authenticate(request: Request, env: Env): Response | null {
-  const url = new URL(request.url);
-
-  // Health check endpoints do not require authentication
-  if (url.pathname === "/" || url.pathname === "/health") return null;
-
-  // Only enforce auth on /mcp
-  if (!url.pathname.startsWith("/mcp")) return null;
-
-  // Skip auth if MCP_API_KEY is not configured (dev fallback)
+function authenticateApiKey(request: Request, env: Env): Response | null {
   if (!env.MCP_API_KEY) return null;
 
   let apiKey: string | null = null;
 
-  // 1. Authorization: Bearer <token>
   const authHeader = request.headers.get("Authorization");
   if (authHeader) {
     const match = authHeader.match(/^Bearer\s+(.+)$/i);
     if (match) apiKey = match[1];
   }
 
-  // 2. X-API-Key / x-api-key header
   if (!apiKey) {
     apiKey = request.headers.get("X-API-Key") ?? request.headers.get("x-api-key");
   }
 
-  // 3. Query parameter
   if (!apiKey) {
+    const url = new URL(request.url);
     apiKey = url.searchParams.get("api_key");
   }
 
-  if (!apiKey || apiKey !== env.MCP_API_KEY) {
-    return new Response(
-      JSON.stringify({
-        error: "Unauthorized",
-        message: "Invalid or missing API key. Provide it via 'Authorization: Bearer <key>', 'X-API-Key: <key>' header, or '?api_key=<key>' query parameter.",
-        supported_auth: [
-          "Authorization: Bearer <key>",
-          "X-API-Key: <key>",
-          "?api_key=<key>"
-        ]
-      }),
-      {
-        status: 401,
-        headers: {
-          "Content-Type": "application/json",
-          "WWW-Authenticate": "Bearer realm=\"github-mcp-cloudflare\""
-        }
-      }
-    );
-  }
+  if (apiKey && apiKey === env.MCP_API_KEY) return null; // valid
 
-  return null;
+  return new Response(
+    JSON.stringify({
+      error: "Unauthorized",
+      message: "Invalid or missing API key.",
+      supported_auth: [
+        "Authorization: Bearer <key>",
+        "X-API-Key: <key>",
+        "?api_key=<key>"
+      ]
+    }),
+    {
+      status: 401,
+      headers: {
+        "Content-Type": "application/json",
+        "WWW-Authenticate": 'Bearer realm="github-mcp-cloudflare"'
+      }
+    }
+  );
 }
 
+// ---------------------------------------------------------------------------
+// MCP Agent
+// ---------------------------------------------------------------------------
+
 export class GitHubMCP extends McpAgent {
-  server = new McpServer({ name: "github-mcp", version: "1.0.0" });
+  server = new McpServer({ name: "github-mcp", version: "2.0.0" });
+
+  // Token used for GitHub API calls.
+  // OAuth flow: stored in props by OAuthProvider
+  // API key flow: GITHUB_TOKEN env var
+  private githubToken(): string {
+    const props = (this as unknown as { props?: { githubToken?: string } }).props;
+    if (props?.githubToken) return props.githubToken;
+    return (this.env as Env).GITHUB_TOKEN;
+  }
 
   async init() {
-    const token = () => (this.env as Env).GITHUB_TOKEN;
+    const token = () => this.githubToken();
 
     // ----------------------------------------
     // Read tools
@@ -140,12 +145,12 @@ export class GitHubMCP extends McpAgent {
 
     this.server.tool(
       "list_contents",
-      "List files and directories at a given path in a GitHub repository. Use path '/' or '' for the root directory.",
+      "List files and directories at a given path in a GitHub repository.",
       {
         owner: z.string().describe("Repository owner (username or organization)"),
         repo: z.string().describe("Repository name"),
-        path: z.string().default("").describe("Directory path to list (e.g. 'src' or 'src/components'). Leave empty or use '/' for root."),
-        ref: z.string().optional().describe("Branch, tag, or commit SHA (default: repository's default branch)"),
+        path: z.string().default("").describe("Directory path. Leave empty for root."),
+        ref: z.string().optional().describe("Branch, tag, or commit SHA"),
       },
       async ({ owner, repo, path, ref }) => {
         const cleanPath = path.replace(/^\/+/, "");
@@ -159,12 +164,11 @@ export class GitHubMCP extends McpAgent {
           return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
         }
 
-        // GitHub returns an array for directories, object for files
         if (!Array.isArray(data)) {
           return {
             content: [{
               type: "text" as const,
-              text: `Error: '${cleanPath || "/"}' is a file, not a directory. Use get_contents to read file content.`,
+              text: `'${cleanPath || "/"}' is a file, not a directory. Use get_contents to read file content.`,
             }],
           };
         }
@@ -180,17 +184,13 @@ export class GitHubMCP extends McpAgent {
           }));
 
         const summary = entries
-          .map((e) =>
-            e.type === "dir"
-              ? `📁 ${e.name}/`
-              : `📄 ${e.name} (${e.size ?? 0} bytes)`
-          )
+          .map((e) => e.type === "dir" ? `📁 ${e.name}/` : `📄 ${e.name} (${e.size ?? 0} bytes)`)
           .join("\n");
 
         return {
           content: [{
             type: "text" as const,
-            text: `Contents of '${cleanPath || "/"}' (${entries.length} items):\n\n${summary}\n\n---\nFull metadata:\n${JSON.stringify(entries, null, 2)}`,
+            text: `Contents of '${cleanPath || "/"}' (${entries.length} items):\n\n${summary}\n\n---\n${JSON.stringify(entries, null, 2)}`,
           }],
         };
       }
@@ -198,12 +198,12 @@ export class GitHubMCP extends McpAgent {
 
     this.server.tool(
       "get_contents",
-      "Read the content of a specific file in a GitHub repository. Returns decoded text content.",
+      "Read the content of a specific file in a GitHub repository.",
       {
         owner: z.string().describe("Repository owner (username or organization)"),
         repo: z.string().describe("Repository name"),
-        path: z.string().describe("File path (e.g. 'src/index.ts' or 'README.md')"),
-        ref: z.string().optional().describe("Branch, tag, or commit SHA (default: repository's default branch)"),
+        path: z.string().describe("File path (e.g. 'src/index.ts')"),
+        ref: z.string().optional().describe("Branch, tag, or commit SHA"),
       },
       async ({ owner, repo, path, ref }) => {
         const cleanPath = path.replace(/^\/+/, "");
@@ -221,7 +221,7 @@ export class GitHubMCP extends McpAgent {
           return {
             content: [{
               type: "text" as const,
-              text: `Error: '${cleanPath}' is a directory, not a file. Use list_contents to browse directories.`,
+              text: `'${cleanPath}' is a directory. Use list_contents to browse.`,
             }],
           };
         }
@@ -232,12 +232,11 @@ export class GitHubMCP extends McpAgent {
           return { content: [{ type: "text" as const, text: `Unexpected type: ${file.type}` }] };
         }
 
-        // Decode base64 content
         let decoded: string;
         try {
           decoded = decodeURIComponent(escape(atob(file.content.replace(/\n/g, ""))));
         } catch {
-          decoded = `(Binary file — base64 content below)\n${file.content}`;
+          decoded = `(Binary file)\n${file.content}`;
         }
 
         return {
@@ -255,7 +254,7 @@ export class GitHubMCP extends McpAgent {
 
     this.server.tool(
       "create_or_update_file",
-      "Create or update a file in a GitHub repository and commit it. SHA is required when updating an existing file; omit it for new files.",
+      "Create or update a file in a GitHub repository. SHA is required when updating an existing file.",
       {
         owner: z.string().describe("Repository owner (username or organization)"),
         repo: z.string().describe("Repository name"),
@@ -263,7 +262,7 @@ export class GitHubMCP extends McpAgent {
         content: z.string().describe("File content as plain text"),
         message: z.string().describe("Commit message"),
         branch: z.string().default("main").describe("Target branch (default: main)"),
-        sha: z.string().optional().describe("Blob SHA of the existing file; required when updating"),
+        sha: z.string().optional().describe("Blob SHA of existing file; required when updating"),
       },
       async ({ owner, repo, path, content, message, branch, sha }) => {
         const body: Record<string, unknown> = {
@@ -289,7 +288,7 @@ export class GitHubMCP extends McpAgent {
         owner: z.string().describe("Repository owner (username or organization)"),
         repo: z.string().describe("Repository name"),
         branch: z.string().describe("Name of the new branch to create"),
-        from_branch: z.string().default("main").describe("Source branch to branch from (default: main)"),
+        from_branch: z.string().default("main").describe("Source branch (default: main)"),
       },
       async ({ owner, repo, branch, from_branch }) => {
         const refRes = await fetch(
@@ -299,7 +298,7 @@ export class GitHubMCP extends McpAgent {
         const refData = await refRes.json() as { object?: { sha?: string } };
         const sha = refData?.object?.sha;
         if (!sha) {
-          return { content: [{ type: "text" as const, text: `Error: could not resolve SHA for branch '${from_branch}'` }] };
+          return { content: [{ type: "text" as const, text: `Error: could not resolve SHA for '${from_branch}'` }] };
         }
         const res = await fetch(
           `https://api.github.com/repos/${owner}/${repo}/git/refs`,
@@ -321,9 +320,9 @@ export class GitHubMCP extends McpAgent {
         owner: z.string().describe("Repository owner (username or organization)"),
         repo: z.string().describe("Repository name"),
         title: z.string().describe("Pull request title"),
-        body: z.string().default("").describe("Pull request description body"),
-        head: z.string().describe("Name of the branch to merge from"),
-        base: z.string().default("main").describe("Name of the branch to merge into (default: main)"),
+        body: z.string().default("").describe("Pull request description"),
+        head: z.string().describe("Branch to merge from"),
+        base: z.string().default("main").describe("Branch to merge into (default: main)"),
       },
       async ({ owner, repo, title, body, head, base }) => {
         const res = await fetch(
@@ -341,29 +340,55 @@ export class GitHubMCP extends McpAgent {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
 export default {
-  fetch(request: Request, env: Env): Promise<Response> | Response {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    // Health check endpoints (no auth required)
+    // Health check
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
       return new Response(
         JSON.stringify({
           status: "ok",
           service: "github-mcp-cloudflare",
-          version: "1.0.0",
-          mcp_endpoint: "/mcp",
-          auth_methods: ["Authorization: Bearer <key>", "X-API-Key: <key>", "?api_key=<key>"]
+          version: "2.0.0",
+          endpoints: {
+            mcp_apikey: "/mcp  (Authorization: Bearer <key>)",
+            mcp_oauth: "/oauth/mcp  (OAuth 2.1 via Claude)",
+            authorize: "/oauth/authorize",
+            callback: "/oauth/callback",
+          }
         }),
         { status: 200, headers: { "Content-Type": "application/json" } }
       );
     }
 
-    // Authenticate all /mcp requests
-    const authError = authenticate(request, env);
-    if (authError) return authError;
+    // ── OAuth routes (/oauth/*) ────────────────────────────────────────────
+    if (url.pathname.startsWith("/oauth/")) {
+      return OAuthProvider.serve(
+        {
+          apiHandler: GitHubMCP.serve("/oauth/mcp"),
+          authorizeHandler: new GitHubOAuthHandler(env),
+          clientRegistrationHandler: undefined,
+        },
+        {
+          kv: env.OAUTH_KV,
+          cookieEncryptionKey: env.COOKIE_ENCRYPTION_KEY,
+          pathPrefix: "/oauth",
+        }
+      ).fetch(request, env);
+    }
 
-    // Delegate everything under /mcp to the MCP SDK handler
-    return GitHubMCP.serve("/mcp").fetch(request, env);
+    // ── API Key route (/mcp) ───────────────────────────────────────────────
+    if (url.pathname.startsWith("/mcp")) {
+      const authError = authenticateApiKey(request, env);
+      if (authError) return authError;
+      return GitHubMCP.serve("/mcp").fetch(request, env);
+    }
+
+    return new Response("Not found", { status: 404 });
   },
 };

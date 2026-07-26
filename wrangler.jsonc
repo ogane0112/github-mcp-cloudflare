@@ -11,10 +11,18 @@
       }
     ]
   },
+  "kv_namespaces": [
+    {
+      // Run: wrangler kv namespace create OAUTH_KV
+      // Then paste the resulting id below
+      "binding": "OAUTH_KV",
+      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+    }
+  ],
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["GitHubMCP"]
+      "new_classes": ["GitHubMCP"]
     }
   ]
 }
