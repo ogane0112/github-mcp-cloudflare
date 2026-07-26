@@ -3,24 +3,10 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-01-01",
   "compatibility_flags": ["nodejs_compat"],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "MCP_OBJECT",
-        "class_name": "GitHubMCP"
-      }
-    ]
-  },
   "kv_namespaces": [
     {
       "binding": "OAUTH_KV",
       "id": "ab518c3850f24c9585e01ef29f5f7a9d"
-    }
-  ],
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["GitHubMCP"]
     }
   ]
 }
