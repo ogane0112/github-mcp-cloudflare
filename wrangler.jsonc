@@ -8,5 +8,15 @@
       "binding": "OAUTH_KV",
       "id": "ab518c3850f24c9585e01ef29f5f7a9d"
     }
+  ],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["GitHubMCP"]
+    },
+    {
+      "tag": "v2",
+      "deleted_classes": ["GitHubMCP"]
+    }
   ]
 }
