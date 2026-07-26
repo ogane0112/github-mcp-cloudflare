@@ -7,11 +7,7 @@
     "bindings": [
       {
         "name": "MCP_OBJECT",
-        "class_name": "ApiKeyGitHubMCP"
-      },
-      {
-        "name": "MCP_OAUTH_OBJECT",
-        "class_name": "OAuthGitHubMCP"
+        "class_name": "GitHubMCP"
       }
     ]
   },
@@ -25,11 +21,6 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["GitHubMCP"]
-    },
-    {
-      "tag": "v2",
-      "deleted_classes": ["GitHubMCP"],
-      "new_sqlite_classes": ["ApiKeyGitHubMCP", "OAuthGitHubMCP"]
     }
   ]
 }

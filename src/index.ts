@@ -4,14 +4,11 @@ import { z } from "zod";
 import { handleAuthorize, handleCallback } from "./github-handler";
 
 export interface Env {
-  GITHUB_TOKEN: string;
-  MCP_API_KEY: string;
   GITHUB_CLIENT_ID: string;
   GITHUB_CLIENT_SECRET: string;
   COOKIE_ENCRYPTION_KEY: string;
   OAUTH_KV: KVNamespace;
   MCP_OBJECT: DurableObjectNamespace;
-  MCP_OAUTH_OBJECT: DurableObjectNamespace;
 }
 
 const githubHeaders = (token: string) => ({
@@ -21,130 +18,109 @@ const githubHeaders = (token: string) => ({
   Accept: "application/vnd.github+json",
 });
 
-function authenticateApiKey(request: Request, env: Env): Response | null {
-  if (!env.MCP_API_KEY) return null;
-  let apiKey: string | null = null;
-  const authHeader = request.headers.get("Authorization");
-  if (authHeader) { const m = authHeader.match(/^Bearer\s+(.+)$/i); if (m) apiKey = m[1]; }
-  if (!apiKey) apiKey = request.headers.get("X-API-Key") ?? request.headers.get("x-api-key");
-  if (!apiKey) apiKey = new URL(request.url).searchParams.get("api_key");
-  if (apiKey && apiKey === env.MCP_API_KEY) return null;
-  return new Response(
-    JSON.stringify({ error: "Unauthorized", message: "Invalid or missing API key." }),
-    { status: 401, headers: { "Content-Type": "application/json", "WWW-Authenticate": 'Bearer realm="github-mcp-cloudflare"' } }
-  );
-}
-
 // ---------------------------------------------------------------------------
-// Shared tool registration helper
+// MCP Agent (OAuth only)
+// githubToken is injected via props from the OAuth Bearer token
 // ---------------------------------------------------------------------------
 
-function registerTools(server: McpServer, getToken: () => string) {
-  server.tool("get_repo", "Get information about a GitHub repository.",
-    { owner: z.string(), repo: z.string() },
-    async ({ owner, repo }) => {
-      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers: githubHeaders(getToken()) });
-      return { content: [{ type: "text" as const, text: JSON.stringify(await res.json(), null, 2) }] };
-    }
-  );
-  server.tool("list_issues", "List issues in a GitHub repository.",
-    { owner: z.string(), repo: z.string() },
-    async ({ owner, repo }) => {
-      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/issues`, { headers: githubHeaders(getToken()) });
-      return { content: [{ type: "text" as const, text: JSON.stringify(await res.json(), null, 2) }] };
-    }
-  );
-  server.tool("list_pull_requests", "List pull requests in a GitHub repository.",
-    { owner: z.string(), repo: z.string() },
-    async ({ owner, repo }) => {
-      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls`, { headers: githubHeaders(getToken()) });
-      return { content: [{ type: "text" as const, text: JSON.stringify(await res.json(), null, 2) }] };
-    }
-  );
-  server.tool("list_contents", "List files and directories in a GitHub repository.",
-    { owner: z.string(), repo: z.string(), path: z.string().default(""), ref: z.string().optional() },
-    async ({ owner, repo, path, ref }) => {
-      const cleanPath = path.replace(/^\/+/, "");
-      const url = new URL(`https://api.github.com/repos/${owner}/${repo}/contents/${cleanPath}`);
-      if (ref) url.searchParams.set("ref", ref);
-      const res = await fetch(url.toString(), { headers: githubHeaders(getToken()) });
-      const data = await res.json() as unknown;
-      if (!res.ok) return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
-      if (!Array.isArray(data)) return { content: [{ type: "text" as const, text: `'${cleanPath || "/"}' is a file. Use get_contents.` }] };
-      const entries = (data as Array<{ type: string; name: string; path: string; size: number; sha: string }>).map(i => ({ type: i.type, name: i.name, path: i.path, size: i.type === "file" ? i.size : undefined, sha: i.sha }));
-      const summary = entries.map(e => e.type === "dir" ? `📁 ${e.name}/` : `📄 ${e.name} (${e.size ?? 0} bytes)`).join("\n");
-      return { content: [{ type: "text" as const, text: `Contents of '${cleanPath || "/"}' (${entries.length} items):\n\n${summary}\n\n---\n${JSON.stringify(entries, null, 2)}` }] };
-    }
-  );
-  server.tool("get_contents", "Read the content of a file in a GitHub repository.",
-    { owner: z.string(), repo: z.string(), path: z.string(), ref: z.string().optional() },
-    async ({ owner, repo, path, ref }) => {
-      const cleanPath = path.replace(/^\/+/, "");
-      const url = new URL(`https://api.github.com/repos/${owner}/${repo}/contents/${cleanPath}`);
-      if (ref) url.searchParams.set("ref", ref);
-      const res = await fetch(url.toString(), { headers: githubHeaders(getToken()) });
-      const data = await res.json() as unknown;
-      if (!res.ok) return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
-      if (Array.isArray(data)) return { content: [{ type: "text" as const, text: `'${cleanPath}' is a directory. Use list_contents.` }] };
-      const file = data as { type: string; path: string; size: number; sha: string; content: string; html_url: string };
-      let decoded: string;
-      try { decoded = decodeURIComponent(escape(atob(file.content.replace(/\n/g, "")))); }
-      catch { decoded = `(Binary)\n${file.content}`; }
-      return { content: [{ type: "text" as const, text: `File: ${file.path}\nSHA: ${file.sha}\nSize: ${file.size} bytes\n\n---\n${decoded}` }] };
-    }
-  );
-  server.tool("create_or_update_file", "Create or update a file in a GitHub repository.",
-    { owner: z.string(), repo: z.string(), path: z.string(), content: z.string(), message: z.string(), branch: z.string().default("main"), sha: z.string().optional() },
-    async ({ owner, repo, path, content, message, branch, sha }) => {
-      const body: Record<string, unknown> = { message, content: btoa(unescape(encodeURIComponent(content))), branch };
-      if (sha) body.sha = sha;
-      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path}`, { method: "PUT", headers: githubHeaders(getToken()), body: JSON.stringify(body) });
-      return { content: [{ type: "text" as const, text: JSON.stringify(await res.json(), null, 2) }] };
-    }
-  );
-  server.tool("create_branch", "Create a new branch in a GitHub repository.",
-    { owner: z.string(), repo: z.string(), branch: z.string(), from_branch: z.string().default("main") },
-    async ({ owner, repo, branch, from_branch }) => {
-      const refRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${from_branch}`, { headers: githubHeaders(getToken()) });
-      const refData = await refRes.json() as { object?: { sha?: string } };
-      const sha = refData?.object?.sha;
-      if (!sha) return { content: [{ type: "text" as const, text: `Error: could not resolve SHA for '${from_branch}'` }] };
-      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/refs`, { method: "POST", headers: githubHeaders(getToken()), body: JSON.stringify({ ref: `refs/heads/${branch}`, sha }) });
-      return { content: [{ type: "text" as const, text: JSON.stringify(await res.json(), null, 2) }] };
-    }
-  );
-  server.tool("create_pull_request", "Create a pull request in a GitHub repository.",
-    { owner: z.string(), repo: z.string(), title: z.string(), body: z.string().default(""), head: z.string(), base: z.string().default("main") },
-    async ({ owner, repo, title, body, head, base }) => {
-      const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls`, { method: "POST", headers: githubHeaders(getToken()), body: JSON.stringify({ title, body, head, base }) });
-      return { content: [{ type: "text" as const, text: JSON.stringify(await res.json(), null, 2) }] };
-    }
-  );
-}
+export class GitHubMCP extends McpAgent {
+  server = new McpServer({ name: "github-mcp", version: "3.0.0" });
 
-// ---------------------------------------------------------------------------
-// OAuth MCP Agent (Claude) — served on /oauth/mcp
-// Uses GitHub token from OAuth flow via props
-// ---------------------------------------------------------------------------
-
-export class OAuthGitHubMCP extends McpAgent {
-  server = new McpServer({ name: "github-mcp-oauth", version: "2.0.0" });
   async init() {
     const props = (this as unknown as { props?: { githubToken?: string } }).props;
-    const token = props?.githubToken ?? (this.env as Env).GITHUB_TOKEN;
-    registerTools(this.server, () => token);
-  }
-}
+    const token = props?.githubToken ?? "";
 
-// ---------------------------------------------------------------------------
-// API Key MCP Agent (Perplexity) — served on /mcp
-// Uses GITHUB_TOKEN env var
-// ---------------------------------------------------------------------------
+    this.server.tool("get_repo", "Get information about a GitHub repository.",
+      { owner: z.string(), repo: z.string() },
+      async ({ owner, repo }) => {
+        const res = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers: githubHeaders(token) });
+        return { content: [{ type: "text" as const, text: JSON.stringify(await res.json(), null, 2) }] };
+      }
+    );
 
-export class ApiKeyGitHubMCP extends McpAgent {
-  server = new McpServer({ name: "github-mcp-apikey", version: "2.0.0" });
-  async init() {
-    registerTools(this.server, () => (this.env as Env).GITHUB_TOKEN);
+    this.server.tool("list_issues", "List issues in a GitHub repository.",
+      { owner: z.string(), repo: z.string() },
+      async ({ owner, repo }) => {
+        const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/issues`, { headers: githubHeaders(token) });
+        return { content: [{ type: "text" as const, text: JSON.stringify(await res.json(), null, 2) }] };
+      }
+    );
+
+    this.server.tool("list_pull_requests", "List pull requests in a GitHub repository.",
+      { owner: z.string(), repo: z.string() },
+      async ({ owner, repo }) => {
+        const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls`, { headers: githubHeaders(token) });
+        return { content: [{ type: "text" as const, text: JSON.stringify(await res.json(), null, 2) }] };
+      }
+    );
+
+    this.server.tool("list_contents", "List files and directories in a GitHub repository.",
+      { owner: z.string(), repo: z.string(), path: z.string().default(""), ref: z.string().optional() },
+      async ({ owner, repo, path, ref }) => {
+        const cleanPath = path.replace(/^\/+/, "");
+        const url = new URL(`https://api.github.com/repos/${owner}/${repo}/contents/${cleanPath}`);
+        if (ref) url.searchParams.set("ref", ref);
+        const res = await fetch(url.toString(), { headers: githubHeaders(token) });
+        const data = await res.json() as unknown;
+        if (!res.ok) return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+        if (!Array.isArray(data)) return { content: [{ type: "text" as const, text: `'${cleanPath || "/"}' is a file. Use get_contents.` }] };
+        const entries = (data as Array<{ type: string; name: string; path: string; size: number; sha: string }>)
+          .map(i => ({ type: i.type, name: i.name, path: i.path, size: i.type === "file" ? i.size : undefined, sha: i.sha }));
+        const summary = entries.map(e => e.type === "dir" ? `📁 ${e.name}/` : `📄 ${e.name} (${e.size ?? 0} bytes)`).join("\n");
+        return { content: [{ type: "text" as const, text: `Contents of '${cleanPath || "/"}' (${entries.length} items):\n\n${summary}\n\n---\n${JSON.stringify(entries, null, 2)}` }] };
+      }
+    );
+
+    this.server.tool("get_contents", "Read the content of a file in a GitHub repository.",
+      { owner: z.string(), repo: z.string(), path: z.string(), ref: z.string().optional() },
+      async ({ owner, repo, path, ref }) => {
+        const cleanPath = path.replace(/^\/+/, "");
+        const url = new URL(`https://api.github.com/repos/${owner}/${repo}/contents/${cleanPath}`);
+        if (ref) url.searchParams.set("ref", ref);
+        const res = await fetch(url.toString(), { headers: githubHeaders(token) });
+        const data = await res.json() as unknown;
+        if (!res.ok) return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+        if (Array.isArray(data)) return { content: [{ type: "text" as const, text: `'${cleanPath}' is a directory. Use list_contents.` }] };
+        const file = data as { type: string; path: string; size: number; sha: string; content: string };
+        let decoded: string;
+        try { decoded = decodeURIComponent(escape(atob(file.content.replace(/\n/g, "")))); }
+        catch { decoded = `(Binary)\n${file.content}`; }
+        return { content: [{ type: "text" as const, text: `File: ${file.path}\nSHA: ${file.sha}\nSize: ${file.size} bytes\n\n---\n${decoded}` }] };
+      }
+    );
+
+    this.server.tool("create_or_update_file", "Create or update a file in a GitHub repository.",
+      { owner: z.string(), repo: z.string(), path: z.string(), content: z.string(), message: z.string(), branch: z.string().default("main"), sha: z.string().optional() },
+      async ({ owner, repo, path, content, message, branch, sha }) => {
+        const body: Record<string, unknown> = { message, content: btoa(unescape(encodeURIComponent(content))), branch };
+        if (sha) body.sha = sha;
+        const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${path}`,
+          { method: "PUT", headers: githubHeaders(token), body: JSON.stringify(body) });
+        return { content: [{ type: "text" as const, text: JSON.stringify(await res.json(), null, 2) }] };
+      }
+    );
+
+    this.server.tool("create_branch", "Create a new branch in a GitHub repository.",
+      { owner: z.string(), repo: z.string(), branch: z.string(), from_branch: z.string().default("main") },
+      async ({ owner, repo, branch, from_branch }) => {
+        const refRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/ref/heads/${from_branch}`, { headers: githubHeaders(token) });
+        const refData = await refRes.json() as { object?: { sha?: string } };
+        const sha = refData?.object?.sha;
+        if (!sha) return { content: [{ type: "text" as const, text: `Error: could not resolve SHA for '${from_branch}'` }] };
+        const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/refs`,
+          { method: "POST", headers: githubHeaders(token), body: JSON.stringify({ ref: `refs/heads/${branch}`, sha }) });
+        return { content: [{ type: "text" as const, text: JSON.stringify(await res.json(), null, 2) }] };
+      }
+    );
+
+    this.server.tool("create_pull_request", "Create a pull request in a GitHub repository.",
+      { owner: z.string(), repo: z.string(), title: z.string(), body: z.string().default(""), head: z.string(), base: z.string().default("main") },
+      async ({ owner, repo, title, body, head, base }) => {
+        const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls`,
+          { method: "POST", headers: githubHeaders(token), body: JSON.stringify({ title, body, head, base }) });
+        return { content: [{ type: "text" as const, text: JSON.stringify(await res.json(), null, 2) }] };
+      }
+    );
   }
 }
 
@@ -159,16 +135,12 @@ export default {
     // Health check
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
       return new Response(JSON.stringify({
-        status: "ok", service: "github-mcp-cloudflare", version: "2.0.0",
-        endpoints: {
-          mcp_apikey: "/mcp  (Authorization: Bearer <key>)",
-          mcp_oauth: "/oauth/mcp  (OAuth 2.1 via Claude)",
-          authorize: "/oauth/authorize", callback: "/oauth/callback",
-        }
+        status: "ok", service: "github-mcp-cloudflare", version: "3.0.0",
+        endpoints: { mcp: "/mcp  (OAuth 2.1)", authorize: "/oauth/authorize", callback: "/oauth/callback" }
       }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
 
-    // OAuth discovery metadata
+    // OAuth discovery
     if (url.pathname === "/.well-known/oauth-authorization-server") {
       return new Response(JSON.stringify({
         issuer: url.origin,
@@ -203,15 +175,13 @@ export default {
       return handleOAuthToken(request, env);
     }
 
-    // OAuth dynamic client registration
+    // Dynamic client registration
     if (url.pathname === "/oauth/register") {
       return handleClientRegistration(request, env);
     }
 
-    // OAuth MCP — Claude connects here
-    // OAuthGitHubMCP is a SEPARATE class from ApiKeyGitHubMCP,
-    // so /streamable-http from each class is completely isolated
-    if (url.pathname.startsWith("/oauth/mcp")) {
+    // MCP endpoint — requires OAuth Bearer token
+    if (url.pathname.startsWith("/mcp")) {
       const authHeader = request.headers.get("Authorization");
       if (!authHeader?.startsWith("Bearer ")) {
         return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -223,14 +193,7 @@ export default {
         });
       }
       const githubToken = authHeader.slice(7);
-      return OAuthGitHubMCP.serve("/oauth/mcp", { props: { githubToken } } as never).fetch(request, env);
-    }
-
-    // API Key MCP — Perplexity connects here
-    if (url.pathname.startsWith("/mcp")) {
-      const authError = authenticateApiKey(request, env);
-      if (authError) return authError;
-      return ApiKeyGitHubMCP.serve("/mcp").fetch(request, env);
+      return GitHubMCP.serve("/mcp", { props: { githubToken } } as never).fetch(request, env);
     }
 
     return new Response("Not found", { status: 404 });
