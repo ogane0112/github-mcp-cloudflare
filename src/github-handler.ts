@@ -1,132 +1,96 @@
 import type { Env } from "./index";
-import { renderApprovalDialog, generateStateParam, verifyStateParam } from "./workers-oauth-utils";
+import { generateStateParam, verifyStateParam, renderApprovalDialog } from "./workers-oauth-utils";
 
 /**
- * GitHubOAuthHandler handles /oauth/authorize and /oauth/callback
- * and is consumed by OAuthProvider.serve().
+ * Handle GET /oauth/authorize
+ * Show GitHub consent dialog
  */
-export class GitHubOAuthHandler {
-  private env: Env;
+export async function handleAuthorize(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
 
-  constructor(env: Env) {
-    this.env = env;
+  // Params from Claude's OAuth request
+  const clientId = url.searchParams.get("client_id") ?? "";
+  const redirectUri = url.searchParams.get("redirect_uri") ?? "";
+  const mcpState = url.searchParams.get("state") ?? "";
+  const codeChallenge = url.searchParams.get("code_challenge") ?? "";
+  const codeChallengeMethod = url.searchParams.get("code_challenge_method") ?? "";
+
+  // Sign our own state to preserve Claude's params through GitHub redirect
+  const statePayload = await generateStateParam(
+    { mcpState, redirectUri, clientId, codeChallenge, codeChallengeMethod },
+    env.COOKIE_ENCRYPTION_KEY
+  );
+
+  const githubAuthUrl = new URL("https://github.com/login/oauth/authorize");
+  githubAuthUrl.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
+  githubAuthUrl.searchParams.set("redirect_uri", `${url.origin}/oauth/callback`);
+  githubAuthUrl.searchParams.set("scope", "repo read:user");
+  githubAuthUrl.searchParams.set("state", statePayload);
+
+  const html = renderApprovalDialog({
+    appName: "GitHub MCP Server",
+    appDescription: "Claude からあなたの GitHub リポジトリにアクセスします。",
+    scopes: ["repo", "read:user"],
+    githubAuthUrl: githubAuthUrl.toString(),
+  });
+
+  return new Response(html, { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+}
+
+/**
+ * Handle GET /oauth/callback
+ * Exchange GitHub code -> GitHub token -> store -> redirect back to Claude
+ */
+export async function handleCallback(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const stateParam = url.searchParams.get("state") ?? "";
+
+  if (!code) {
+    return new Response("Missing code", { status: 400 });
   }
 
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (url.pathname === "/oauth/authorize") {
-      return this.handleAuthorize(request);
-    }
-    if (url.pathname === "/oauth/callback") {
-      return this.handleCallback(request);
-    }
-
-    return new Response("Not found", { status: 404 });
+  // Verify and unpack our signed state
+  let payload: Record<string, string>;
+  try {
+    payload = await verifyStateParam(stateParam, env.COOKIE_ENCRYPTION_KEY);
+  } catch {
+    return new Response("Invalid state", { status: 400 });
   }
 
-  // Step 1: Show GitHub OAuth consent page
-  private async handleAuthorize(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const clientId = this.env.GITHUB_CLIENT_ID;
+  const { mcpState, redirectUri, clientId, codeChallenge, codeChallengeMethod } = payload;
 
-    // Preserve the MCP OAuth state from the caller
-    const mcpState = url.searchParams.get("state") ?? "";
-    const redirectUri = `${url.origin}/oauth/callback`;
+  // Exchange GitHub code for GitHub access token
+  const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({
+      client_id: env.GITHUB_CLIENT_ID,
+      client_secret: env.GITHUB_CLIENT_SECRET,
+      code,
+      redirect_uri: `${url.origin}/oauth/callback`,
+    }),
+  });
 
-    // Generate a signed state that embeds the original MCP state
-    const statePayload = await generateStateParam(
-      { mcpState },
-      this.env.COOKIE_ENCRYPTION_KEY
-    );
-
-    const githubAuthUrl = new URL("https://github.com/login/oauth/authorize");
-    githubAuthUrl.searchParams.set("client_id", clientId);
-    githubAuthUrl.searchParams.set("redirect_uri", redirectUri);
-    githubAuthUrl.searchParams.set("scope", "repo read:user");
-    githubAuthUrl.searchParams.set("state", statePayload);
-
-    // Show an approval dialog instead of redirecting immediately
-    const html = renderApprovalDialog({
-      appName: "GitHub MCP Server",
-      appDescription: "Access your GitHub repositories via MCP.",
-      scopes: ["repo", "read:user"],
-      githubAuthUrl: githubAuthUrl.toString(),
-    });
-
-    return new Response(html, {
-      headers: { "Content-Type": "text/html;charset=UTF-8" },
-    });
+  const tokenData = await tokenRes.json() as { access_token?: string; error?: string };
+  if (!tokenData.access_token) {
+    return new Response(`GitHub OAuth error: ${tokenData.error ?? "no token"}`, { status: 400 });
   }
 
-  // Step 2: Exchange GitHub code for access token
-  private async handleCallback(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const code = url.searchParams.get("code");
-    const stateParam = url.searchParams.get("state") ?? "";
+  // Generate a short-lived MCP authorization code
+  const mcpCode = crypto.randomUUID();
 
-    if (!code) {
-      return new Response("Missing code", { status: 400 });
-    }
+  // Store GitHub token keyed by MCP code (TTL: 5 minutes)
+  await env.OAUTH_KV.put(
+    `code:${mcpCode}`,
+    JSON.stringify({ githubToken: tokenData.access_token }),
+    { expirationTtl: 300 }
+  );
 
-    // Verify and unpack state
-    let mcpState: string;
-    try {
-      const payload = await verifyStateParam(stateParam, this.env.COOKIE_ENCRYPTION_KEY);
-      mcpState = payload.mcpState ?? "";
-    } catch {
-      return new Response("Invalid state parameter", { status: 400 });
-    }
+  // Redirect back to Claude with MCP code
+  const callbackUrl = new URL(redirectUri);
+  callbackUrl.searchParams.set("code", mcpCode);
+  if (mcpState) callbackUrl.searchParams.set("state", mcpState);
 
-    // Exchange code for GitHub access token
-    const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({
-        client_id: this.env.GITHUB_CLIENT_ID,
-        client_secret: this.env.GITHUB_CLIENT_SECRET,
-        code,
-        redirect_uri: `${url.origin}/oauth/callback`,
-      }),
-    });
-
-    const tokenData = await tokenRes.json() as { access_token?: string; error?: string };
-
-    if (!tokenData.access_token) {
-      return new Response(
-        `GitHub OAuth error: ${tokenData.error ?? "no access_token returned"}`,
-        { status: 400 }
-      );
-    }
-
-    const githubToken = tokenData.access_token;
-
-    // Fetch GitHub user info
-    const userRes = await fetch("https://api.github.com/user", {
-      headers: {
-        Authorization: `token ${githubToken}`,
-        "User-Agent": "github-mcp-cloudflare",
-        Accept: "application/vnd.github+json",
-      },
-    });
-    const user = await userRes.json() as { login?: string; name?: string; id?: number };
-
-    // Return props that will be passed to McpAgent
-    // OAuthProvider will store these and inject via props on each MCP request
-    const props = {
-      githubToken,
-      githubLogin: user.login ?? "",
-      githubName: user.name ?? user.login ?? "",
-    };
-
-    // Hand back to OAuthProvider so it can complete the MCP OAuth flow
-    // by returning a special redirect with the token bound to the session
-    return new Response(
-      JSON.stringify({ ok: true, props, state: mcpState }),
-      { headers: { "Content-Type": "application/json" } }
-    );
-  }
+  return Response.redirect(callbackUrl.toString(), 302);
 }
